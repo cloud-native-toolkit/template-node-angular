@@ -11,14 +11,15 @@
  */
 
 def buildAgentName(String jobName, String buildNumber) {
-    if (jobName.length() > 40) {
-        jobName = jobName.substring(0, 40);
+    if (jobName.length() > 55) {
+        jobName = jobName.substring(0, 55);
     }
 
-    return "agent.${jobName}${buildNumber}".replace('_', '-').replace('/', '-').replace('-.', '.');
+    return "a.${jobName}${buildNumber}".replace('_', '-').replace('/', '-').replace('-.', '.');
 }
 
 def buildLabel = buildAgentName(env.JOB_NAME, env.BUILD_NUMBER);
+def namespace = env.NAMESPACE ?: "dev"
 def cloudName = env.CLOUD_NAME == "openshift" ? "openshift" : "kubernetes"
 def workingDir = "/home/jenkins/agent"
 podTemplate(
@@ -64,9 +65,6 @@ spec:
         - secretRef:
             name: artifactory-access
             optional: true
-        - secretRef:
-            name: gitops-cd-secret
-            optional: true
       env:
         - name: CHART_NAME
           value: template-node-angular
@@ -77,9 +75,21 @@ spec:
         - name: HOME
           value: /home/devops
         - name: ENVIRONMENT_NAME
-          value: dev
+          value: ${env.NAMESPACE}
         - name: BUILD_NUMBER
           value: ${env.BUILD_NUMBER}
+    - name: trigger-cd
+      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.8
+      tty: true
+      command: ["/bin/bash"]
+      workingDir: ${workingDir}
+      env:
+        - name: HOME
+          value: /home/devops
+      envFrom:
+        - secretRef:
+            name: gitops-cd-secret
+            optional: true
 """
 ) {
     node(buildLabel) {
@@ -87,11 +97,13 @@ spec:
             checkout scm
             stage('Setup') {
                 sh '''#!/bin/bash
-                    set -x
                     # Export project name (lowercase), version, and build number to ./env-config
-                    npm run env | grep "^npm_package_name" | tr '[:upper:]' '[:lower:]' | sed "s/_/-/g" | sed "s/npm-package-name/IMAGE_NAME/g" > ./env-config
+                    IMAGE_NAME=$(basename -s .git `git config --get remote.origin.url` | tr '[:upper:]' '[:lower:]' | sed "s/_/-/g")
+
+                    echo "IMAGE_NAME=${IMAGE_NAME}" > ./env-config
                     npm run env | grep "^npm_package_version" | sed "s/npm_package_version/IMAGE_VERSION/g" >> ./env-config
                     echo "BUILD_NUMBER=${BUILD_NUMBER}" >> ./env-config
+
                     cat ./env-config
                 '''
             }
@@ -107,7 +119,6 @@ spec:
             }
             stage('Test') {
                 sh '''#!/bin/bash
-                    set -x
                     npm test
                 '''
             }
@@ -119,7 +130,6 @@ spec:
                   exit 0
                 fi
 
-                set -x
                 npm run sonarqube:scan
                 '''
             }
@@ -128,42 +138,35 @@ spec:
 
             stage('Build image') {
                 sh '''#!/bin/bash
-                    set -x
-                    
+
                     . ./env-config
 
-                    echo "Checking registry namespace: ${REGISTRY_NAMESPACE}"
-                    NS=$( ibmcloud cr namespaces | grep ${REGISTRY_NAMESPACE} ||: )
-                    if [[ -z "${NS}" ]]; then
-                        echo -e "Registry namespace ${REGISTRY_NAMESPACE} not found, creating it."
-                        ibmcloud cr namespace-add ${REGISTRY_NAMESPACE}
-                    else
-                        echo -e "Registry namespace ${REGISTRY_NAMESPACE} found."
-                    fi
-
-                    echo -e "Existing images in registry"
-                    ibmcloud cr images --restrict "${REGISTRY_NAMESPACE}/${IMAGE_NAME}"
-                    
                     echo -e "=========================================================================================="
                     echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
-                    set -x
                     ibmcloud cr build -t ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION} .
+                    if [[ $? -ne 0 ]]; then
+                      exit 1
+                    fi
+
                     if [[ -n "${BUILD_NUMBER}" ]]; then
                         echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}-${BUILD_NUMBER}"
                         ibmcloud cr image-tag ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION} ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}-${BUILD_NUMBER}
                     fi
-                    
-                    echo -e "Available images in registry"
-                    ibmcloud cr images --restrict ${REGISTRY_NAMESPACE}/${IMAGE_NAME}
                 '''
             }
             stage('Deploy to DEV env') {
                 sh '''#!/bin/bash
-                    set -x
+                    echo "Deploying to ${ENVIRONMENT_NAME}"
 
                     . ./env-config
+
+                    if [[ "${CHART_NAME}" != "${IMAGE_NAME}" ]]; then
+                      cp -R "${CHART_ROOT}/${CHART_NAME}" "${CHART_ROOT}/${IMAGE_NAME}"
+                      cat "${CHART_ROOT}/${CHART_NAME}/Chart.yaml" | \
+                          yq w - name "${IMAGE_NAME}" > "${CHART_ROOT}/${IMAGE_NAME}/Chart.yaml"
+                    fi
                     
-                    CHART_PATH="${CHART_ROOT}/${CHART_NAME}"
+                    CHART_PATH="${CHART_ROOT}/${IMAGE_NAME}"
 
                     echo "KUBECONFIG=${KUBECONFIG}"
 
@@ -179,6 +182,9 @@ spec:
                     
                     echo "CHECKING CHART (lint)"
                     helm lint ${CHART_PATH}
+                    if [[ $? -ne 0 ]]; then
+                      exit 1
+                    fi
                     
                     IMAGE_REPOSITORY="${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}"
                     PIPELINE_IMAGE_URL="${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
@@ -211,7 +217,6 @@ spec:
             stage('Health Check') {
                 sh '''#!/bin/bash
                     . ./env-config
-                    
                     INGRESS_NAME="${IMAGE_NAME}"
                     INGRESS_HOST=$(kubectl get ingress/${INGRESS_NAME} --namespace ${ENVIRONMENT_NAME} --output=jsonpath='{ .spec.rules[0].host }')
                     PORT='80'
@@ -231,7 +236,6 @@ spec:
             }
             stage('Package Helm Chart') {
                 sh '''#!/bin/bash
-                set -x
 
                 if [[ -z "${ARTIFACTORY_ENCRPT}" ]]; then
                   echo "Skipping Artifactory step as Artifactory is not installed or configured"
@@ -249,8 +253,6 @@ spec:
                     exit 1
                 fi
 
-                sudo apt-get install jq.
-
                 # Check if a Generic Local Repo has been created and retrieve the URL for it
                 export URL=$(curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD} -X GET "${ARTIFACTORY_URL}/artifactory/api/repositories?type=LOCAL" | jq '.[0].url' | tr -d \\")
                 echo ${URL}
@@ -264,7 +266,7 @@ spec:
                 fi;
 
                 # Package Helm Chart
-                helm package --version ${IMAGE_BUILD_VERSION} chart/${CHART_NAME}
+                helm package --version ${IMAGE_BUILD_VERSION} ${CHART_ROOT}/${IMAGE_NAME}
 
                 # Get the index and re index it with current Helm Chart
                 curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRPT} -O "${URL}/${REGISTRY_NAMESPACE}/index.yaml"
@@ -281,55 +283,57 @@ spec:
                 fi;
 
                 # Persist the Helm Chart in Artifactory for us by ArgoCD
-                curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRPT} -i -vvv -T ${CHART_NAME}-${IMAGE_BUILD_VERSION}.tgz "${URL}/${REGISTRY_NAMESPACE}/${CHART_NAME}-${IMAGE_BUILD_VERSION}.tgz"
+                curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRPT} -i -vvv -T ${IMAGE_NAME}-${IMAGE_BUILD_VERSION}.tgz "${URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}-${IMAGE_BUILD_VERSION}.tgz"
 
                 # Persist the Helm Chart in Artifactory for us by ArgoCD
                 curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRPT} -i -vvv -T index.yaml "${URL}/${REGISTRY_NAMESPACE}/index.yaml"
 
             '''
             }
+        }
+        container(name: 'trigger-cd', shell: '/bin/bash') {
             stage('Trigger CD Pipeline') {
                 sh '''#!/bin/bash
-                    if [[ -z "${GITOPS_CD_URL}" ]]; then
+                    if [[ -z "${url}" ]]; then
+                        echo "'url' not set. Not triggering CD pipeline"
                         exit 0
                     fi
-                    if [[ -z "${GITOPS_CD_BRANCH}" ]]; then
-                        GITOPS_CD_BRANCH="master"
+                    if [[ -z "${host}" ]]; then
+                        echo "'host' not set. Not triggering CD pipeline"
+                        exit 0
                     fi
-                    
+
+                    if [[ -z "${branch}" ]]; then
+                        branch="master"
+                    fi
+
                     . ./env-config
-                    
+
                     if [[ -n "${BUILD_NUMBER}" ]]; then
                       IMAGE_BUILD_VERSION="${IMAGE_VERSION}-${BUILD_NUMBER}"
                     fi
-                    
-                    # This email is not used and it not valid, you can ignore but git requires it
+
+                    # This email is not used and is not valid, you can ignore but git requires it
                     git config --global user.email "jenkins@ibmcloud.com"
                     git config --global user.name "Jenkins Pipeline"
-                    
-                    git clone -b ${GITOPS_CD_BRANCH} ${GITOPS_CD_URL} gitops_cd
+
+                    GIT_URL="https://${username}:${password}@${host}/${org}/${repo}"
+
+                    git clone -b ${branch} ${GIT_URL} gitops_cd
                     cd gitops_cd
-                    
+
                     echo "Requirements before update"
                     cat "./${IMAGE_NAME}/requirements.yaml"
-                    
-                    # Read the helm repo
-                    HELM_REPO=$(yq r ./${IMAGE_NAME}/requirements.yaml 'dependencies[0].repository')
-                    
-                    # Write the updated requirements.yaml
-                    echo "dependencies:" > ./requirements.yaml.tmp
-                    echo "  - name: ${CHART_NAME}" >> ./requirements.yaml.tmp
-                    echo "    version: ${IMAGE_BUILD_VERSION}" >> ./requirements.yaml.tmp
-                    echo "    repository: ${HELM_REPO}" >> ./requirements.yaml.tmp
-                    
-                    cp ./requirements.yaml.tmp "./${IMAGE_NAME}/requirements.yaml"
-                    
+
+                    npm i -g @garage-catalyst/ibm-garage-cloud-cli
+                    igc yq w ./${IMAGE_NAME}/requirements.yaml "dependencies[?(@.name == '${IMAGE_NAME}')].version" ${IMAGE_BUILD_VERSION} -i
+
                     echo "Requirements after update"
                     cat "./${IMAGE_NAME}/requirements.yaml"
-                    
+
                     git add -u
                     git commit -m "Updates ${IMAGE_NAME} to ${IMAGE_BUILD_VERSION}"
-                    git push
+                    git push -v
                 '''
             }
         }
