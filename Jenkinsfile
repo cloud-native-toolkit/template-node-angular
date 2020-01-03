@@ -15,7 +15,9 @@ def buildAgentName(String jobName, String buildNumber) {
         jobName = jobName.substring(0, 55);
     }
 
-    return "a.${jobName}${buildNumber}".replace('_', '-').replace('/', '-').replace('-.', '.');
+    agentName = "a.${jobName}${buildNumber}".replace('_', '-').replace('/', '-').replace('-.', '.');
+
+    return agentName;
 }
 
 def buildLabel = buildAgentName(env.JOB_NAME, env.BUILD_NUMBER);
@@ -135,7 +137,6 @@ spec:
             }
         }
         container(name: 'ibmcloud', shell: '/bin/bash') {
-
             stage('Build image') {
                 sh '''#!/bin/bash
 
